@@ -1,0 +1,6 @@
+/output/
+/state/
+/tmp/
+*.log
+/parser
+.DS_Store

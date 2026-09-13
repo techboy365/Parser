@@ -1,0 +1,54 @@
+kameleo:
+  endpoint: "http://localhost:5050"
+  profile_name_prefix: "parser"
+  device_type: "desktop"
+  browser_product: "chrome"
+  connect_timeout_ms: 90000
+
+browser:
+  google_base_url: "https://www.google.com"
+  navigation_timeout_ms: 60000
+  page_settle_ms: 1500
+  results_per_page: 10
+  max_pages: 100
+
+session:
+  rotate_profile_after_searches: 5
+  rotate_profile_after_captchas: 1
+  idle_profile_ttl_minutes: 30
+  reuse_profiles: true
+
+retry:
+  max_attempts: 3
+  initial_backoff_ms: 2000
+  max_backoff_ms: 30000
+  multiplier: 2.0
+
+captcha:
+  enabled: true
+  max_solve_attempts: 2
+  solver: "noop" # noop | sidecar | manual
+  sidecar_endpoint: "http://127.0.0.1:8787/solve"
+  detect_timeout_ms: 5000
+
+storage:
+  output_dir: "./output"
+  results_file: "results.txt"
+  job_state_dir: "./state"
+
+filter:
+  include_keywords: []
+  exclude_keywords: []
+  include_domains: []
+  exclude_domains: []
+  include_url_patterns: []
+  exclude_url_patterns: []
+  include_path_patterns: []
+  exclude_path_patterns: []
+  include_query_params: []
+  exclude_query_params: []
+  custom_rules: []
+
+logging:
+  level: "info"
+  format: "text" # text | json

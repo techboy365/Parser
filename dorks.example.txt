@@ -1,0 +1,3 @@
+# One dork per line. Lines starting with # are ignored.
+site:example.com filetype:pdf
+inurl:admin intitle:login
