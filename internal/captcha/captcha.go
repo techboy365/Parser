@@ -1,9 +1,11 @@
 package captcha
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 	"time"
@@ -15,11 +17,11 @@ import (
 type ChallengeType string
 
 const (
-	ChallengeNone       ChallengeType = "none"
-	ChallengeRecaptcha  ChallengeType = "recaptcha"
-	ChallengeTurnstile  ChallengeType = "turnstile"
+	ChallengeNone        ChallengeType = "none"
+	ChallengeRecaptcha   ChallengeType = "recaptcha"
+	ChallengeTurnstile   ChallengeType = "turnstile"
 	ChallengeGoogleSorry ChallengeType = "google_sorry"
-	ChallengeUnknown    ChallengeType = "unknown"
+	ChallengeUnknown     ChallengeType = "unknown"
 )
 
 type Detection struct {
@@ -69,7 +71,7 @@ type NoopSolver struct{}
 func (NoopSolver) Name() string { return "noop" }
 
 func (NoopSolver) Solve(ctx context.Context, session *browser.Session, detection Detection) error {
-	return fmt.Errorf("captcha detected (%s): noop solver cannot auto-resolve; rotate session or configure sidecar solver", detection.Type)
+	return fmt.Errorf("captcha detected (%s): configure captcha.solver=sidecar and run captcha-solver", detection.Type)
 }
 
 type ManualSolver struct {
@@ -100,55 +102,87 @@ func (m ManualSolver) Solve(ctx context.Context, session *browser.Session, detec
 
 type SidecarSolver struct {
 	endpoint   string
+	kameleoURL string
+	timeout    time.Duration
+	tiers      config.CaptchaTiersConfig
 	httpClient *http.Client
 }
 
 type sidecarRequest struct {
-	URL       string `json:"url"`
-	Type      string `json:"type"`
-	ProfileID string `json:"profile_id"`
+	URL           string `json:"url"`
+	Type          string `json:"type"`
+	ProfileID     string `json:"profile_id"`
+	CDPEndpoint   string `json:"cdp_endpoint"`
+	KameleoBase   string `json:"kameleo_base"`
+	EnableScript  bool   `json:"enable_script"`
+	EnableToken   bool   `json:"enable_token"`
+	EnableProvider bool  `json:"enable_provider"`
 }
 
 type sidecarResponse struct {
 	Success bool   `json:"success"`
 	Message string `json:"message"`
+	Tier    string `json:"tier,omitempty"`
 }
 
-func NewSidecarSolver(endpoint string) SidecarSolver {
+func NewSidecarSolver(cfg config.CaptchaConfig, kameleoEndpoint string) SidecarSolver {
 	return SidecarSolver{
-		endpoint: endpoint,
-		httpClient: &http.Client{
-			Timeout: 120 * time.Second,
-		},
+		endpoint:   cfg.SidecarEndpoint,
+		kameleoURL: kameleoEndpoint,
+		timeout:    cfgSidecarTimeout(cfg),
+		tiers:      cfg.Tiers,
+		httpClient: &http.Client{Timeout: cfgSidecarTimeout(cfg)},
 	}
+}
+
+func cfgSidecarTimeout(cfg config.CaptchaConfig) time.Duration {
+	if cfg.SidecarTimeoutMS <= 0 {
+		return 180 * time.Second
+	}
+	return time.Duration(cfg.SidecarTimeoutMS) * time.Millisecond
 }
 
 func (s SidecarSolver) Name() string { return "sidecar" }
 
 func (s SidecarSolver) Solve(ctx context.Context, session *browser.Session, detection Detection) error {
+	currentURL := session.CurrentURL()
+	if err := session.Suspend(); err != nil {
+		return fmt.Errorf("suspend session for sidecar: %w", err)
+	}
+
 	payload, err := json.Marshal(sidecarRequest{
-		URL:       session.CurrentURL(),
-		Type:      string(detection.Type),
-		ProfileID: session.ProfileID,
+		URL:            currentURL,
+		Type:           string(detection.Type),
+		ProfileID:      session.ProfileID,
+		CDPEndpoint:    session.CDPEndpoint,
+		KameleoBase:    s.kameleoURL,
+		EnableScript:   s.tiers.Script,
+		EnableToken:    s.tiers.Token,
+		EnableProvider: s.tiers.Provider,
 	})
 	if err != nil {
 		return err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.endpoint, strings.NewReader(string(payload)))
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.endpoint, bytes.NewReader(payload))
 	if err != nil {
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
+
 	resp, err := s.httpClient.Do(req)
 	if err != nil {
 		return fmt.Errorf("sidecar solver request failed: %w", err)
 	}
 	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode >= 300 {
-		return fmt.Errorf("sidecar solver returned %s", resp.Status)
+		return fmt.Errorf("sidecar solver returned %s: %s", resp.Status, strings.TrimSpace(string(body)))
 	}
+
 	var out sidecarResponse
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+	if err := json.Unmarshal(body, &out); err != nil {
 		return fmt.Errorf("decode sidecar response: %w", err)
 	}
 	if !out.Success {
@@ -157,10 +191,10 @@ func (s SidecarSolver) Solve(ctx context.Context, session *browser.Session, dete
 	return nil
 }
 
-func NewSolver(cfg config.CaptchaConfig) Solver {
+func NewSolver(cfg config.CaptchaConfig, kameleoEndpoint string) Solver {
 	switch strings.ToLower(cfg.Solver) {
 	case "sidecar":
-		return NewSidecarSolver(cfg.SidecarEndpoint)
+		return NewSidecarSolver(cfg, kameleoEndpoint)
 	case "manual":
 		return ManualSolver{Wait: 120 * time.Second}
 	default:
@@ -169,16 +203,16 @@ func NewSolver(cfg config.CaptchaConfig) Solver {
 }
 
 type Recovery struct {
-	cfg     config.CaptchaConfig
-	detect  *Detector
-	solver  Solver
+	cfg    config.CaptchaConfig
+	detect *Detector
+	solver Solver
 }
 
-func NewRecovery(cfg config.CaptchaConfig) *Recovery {
+func NewRecovery(cfg config.CaptchaConfig, kameleoEndpoint string) *Recovery {
 	return &Recovery{
 		cfg:    cfg,
 		detect: NewDetector(cfg),
-		solver: NewSolver(cfg),
+		solver: NewSolver(cfg, kameleoEndpoint),
 	}
 }
 
@@ -190,18 +224,23 @@ func (r *Recovery) Handle(ctx context.Context, session *browser.Session) (Detect
 	if err != nil || !d.Detected {
 		return d, err
 	}
+
 	for attempt := 1; attempt <= r.cfg.MaxSolveAttempts; attempt++ {
-		if err := r.solver.Solve(ctx, session, d); err == nil {
-			d2, err2 := r.detect.Detect(session)
-			if err2 != nil {
-				return d, err2
+		if err := r.solver.Solve(ctx, session, d); err != nil {
+			if attempt == r.cfg.MaxSolveAttempts {
+				return d, fmt.Errorf("captcha recovery failed (%s): %w", d.Type, err)
 			}
-			if !d2.Detected {
-				return Detection{Detected: false, Type: ChallengeNone}, nil
-			}
-			d = d2
 			continue
 		}
+		time.Sleep(2 * time.Second)
+		d2, err2 := r.detect.Detect(session)
+		if err2 != nil {
+			return d, err2
+		}
+		if !d2.Detected {
+			return Detection{Detected: false, Type: ChallengeNone}, nil
+		}
+		d = d2
 	}
-	return d, fmt.Errorf("captcha recovery failed after %d attempts (%s)", r.cfg.MaxSolveAttempts, d.Type)
+	return d, fmt.Errorf("captcha still present after recovery (%s)", d.Type)
 }

@@ -107,11 +107,22 @@ func (m *Manager) RecordCaptcha(lease *Lease) {
 	lease.captchas++
 }
 
-func (m *Manager) Rotate(ctx context.Context, requestID string) (*Lease, error) {
-	if err := m.Release(ctx, requestID, true); err != nil {
+func (m *Manager) Reconnect(ctx context.Context, requestID, profileID string) (*Lease, error) {
+	session, err := m.browser.Reconnect(ctx, profileID)
+	if err != nil {
 		return nil, err
 	}
-	return m.Acquire(ctx, requestID)
+	lease := &Lease{
+		ID:        uuid.NewString(),
+		ProfileID: profileID,
+		Session:   session,
+		createdAt: time.Now().UTC(),
+	}
+	session.MarkWarmed()
+	m.mu.Lock()
+	m.active[requestID] = lease
+	m.mu.Unlock()
+	return lease, nil
 }
 
 func (m *Manager) createProfile(ctx context.Context, requestID string) (*kameleo.Profile, error) {
@@ -123,6 +134,8 @@ func (m *Manager) createProfile(ctx context.Context, requestID string) (*kameleo
 	return m.kameleo.CreateProfile(ctx, kameleo.CreateProfileRequest{
 		FingerprintID: fps[0].ID,
 		Name:          name,
+		Language:      m.cfg.Kameleo.Language,
+		Storage:       m.cfg.Kameleo.Storage,
 	})
 }
 

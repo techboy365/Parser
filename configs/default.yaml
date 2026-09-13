@@ -4,6 +4,14 @@ kameleo:
   device_type: "desktop"
   browser_product: "chrome"
   connect_timeout_ms: 90000
+  language: "en-US,en"
+  storage: "local"
+
+network:
+  mode: "hotspot" # hotspot = proxyless carrier egress via phone tether
+  verify_ip_before_search: true
+  ip_check_url: "https://api.ipify.org?format=text"
+  cooldown_on_block_minutes: 45
 
 browser:
   google_base_url: "https://www.google.com"
@@ -11,25 +19,39 @@ browser:
   page_settle_ms: 1500
   results_per_page: 10
   max_pages: 100
+  human_search: true
+  warm_session: true
+  typing_delay_ms: 45
+
+pacing:
+  enabled: true
+  min_action_delay_ms: 2000
+  max_action_delay_ms: 5000
+  max_searches_per_hour: 25
 
 session:
-  rotate_profile_after_searches: 5
-  rotate_profile_after_captchas: 1
-  idle_profile_ttl_minutes: 30
+  rotate_profile_after_searches: 50
+  rotate_profile_after_captchas: 0
+  idle_profile_ttl_minutes: 120
   reuse_profiles: true
 
 retry:
   max_attempts: 3
-  initial_backoff_ms: 2000
-  max_backoff_ms: 30000
+  initial_backoff_ms: 3000
+  max_backoff_ms: 60000
   multiplier: 2.0
 
 captcha:
   enabled: true
-  max_solve_attempts: 2
-  solver: "noop" # noop | sidecar | manual
+  max_solve_attempts: 1
+  solver: "sidecar"
   sidecar_endpoint: "http://127.0.0.1:8787/solve"
+  sidecar_timeout_ms: 180000
   detect_timeout_ms: 5000
+  tiers:
+    script: true
+    token: true
+    provider: true
 
 storage:
   output_dir: "./output"
@@ -51,4 +73,4 @@ filter:
 
 logging:
   level: "info"
-  format: "text" # text | json
+  format: "text"

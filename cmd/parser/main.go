@@ -11,10 +11,13 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/techboy365/Parser/internal/config"
+	"github.com/techboy365/Parser/internal/cooldown"
 	"github.com/techboy365/Parser/internal/filter"
 	"github.com/techboy365/Parser/internal/job"
 	"github.com/techboy365/Parser/internal/kameleo"
 	"github.com/techboy365/Parser/internal/logging"
+	"github.com/techboy365/Parser/internal/network"
+	"github.com/techboy365/Parser/internal/pacing"
 	"github.com/techboy365/Parser/internal/search"
 	"github.com/techboy365/Parser/internal/session"
 	"github.com/techboy365/Parser/internal/storage"
@@ -77,15 +80,24 @@ func main() {
 
 	kClient := kameleo.NewClient(cfg.Kameleo.Endpoint)
 	if err := kClient.VerifyEngineReady(ctx); err != nil {
-		log.Error("kameleo not ready", "error", err)
+		log.Error("kameleo not ready", "error", err, "hint", "start Kameleo Engine on localhost:5050")
 		os.Exit(1)
 	}
 
+	egress := network.NewEgress(cfg.Network)
+	limiter := pacing.NewLimiter(cfg.Pacing)
+	gate := cooldown.NewGate()
 	browserMgr := browserpkg.NewManager(cfg, kClient)
 	sessionMgr := session.NewManager(cfg, kClient, browserMgr, log)
 	defer sessionMgr.Shutdown(ctx)
 
-	runner := search.NewRunner(cfg, sessionMgr, filterEngine, writer, jobStore, log)
+	runner := search.NewRunner(cfg, sessionMgr, egress, limiter, gate, filterEngine, writer, jobStore, log)
+
+	log.Info("parser ready",
+		"network_mode", egress.Mode(),
+		"captcha_solver", cfg.Captcha.Solver,
+		"human_search", cfg.Browser.HumanSearch,
+	)
 
 	for _, query := range queries {
 		req := search.DorkRequest{
@@ -104,6 +116,7 @@ func main() {
 			"query", result.Query,
 			"total_urls", result.TotalFound,
 			"pages", result.PagesScraped,
+			"egress_ip", result.EgressIP,
 			"output", writer.Path(),
 		)
 	}

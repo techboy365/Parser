@@ -28,6 +28,8 @@ type Profile struct {
 type CreateProfileRequest struct {
 	FingerprintID string `json:"fingerprintId"`
 	Name          string `json:"name"`
+	Language      string `json:"language,omitempty"`
+	Storage       string `json:"storage,omitempty"`
 }
 
 func NewClient(endpoint string) *Client {

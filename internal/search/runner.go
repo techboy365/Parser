@@ -6,13 +6,17 @@ import (
 	"log/slog"
 	"strings"
 
+	"github.com/techboy365/Parser/internal/browser"
 	"github.com/techboy365/Parser/internal/captcha"
 	"github.com/techboy365/Parser/internal/config"
+	"github.com/techboy365/Parser/internal/cooldown"
 	"github.com/techboy365/Parser/internal/dedupe"
 	"github.com/techboy365/Parser/internal/extract"
 	"github.com/techboy365/Parser/internal/filter"
 	"github.com/techboy365/Parser/internal/job"
 	"github.com/techboy365/Parser/internal/logging"
+	"github.com/techboy365/Parser/internal/network"
+	"github.com/techboy365/Parser/internal/pacing"
 	"github.com/techboy365/Parser/internal/pagination"
 	"github.com/techboy365/Parser/internal/retry"
 	"github.com/techboy365/Parser/internal/session"
@@ -26,28 +30,36 @@ type DorkRequest struct {
 }
 
 type Result struct {
-	JobID      string
-	RequestID  string
-	Query      string
-	URLs       []string
-	TotalFound int
+	JobID        string
+	RequestID    string
+	Query        string
+	URLs         []string
+	TotalFound   int
 	PagesScraped int
+	EgressIP     string
 }
 
 type Runner struct {
 	cfg       *config.Config
 	sessions  *session.Manager
+	egress    *network.Egress
+	limiter   *pacing.Limiter
+	cooldown  *cooldown.Gate
 	filter    *filter.Engine
 	writer    *storage.Writer
 	jobs      *job.Store
 	captcha   *captcha.Recovery
 	navigator *pagination.Navigator
+	searchNav *browser.SearchNavigator
 	log       *slog.Logger
 }
 
 func NewRunner(
 	cfg *config.Config,
 	sessions *session.Manager,
+	egress *network.Egress,
+	limiter *pacing.Limiter,
+	gate *cooldown.Gate,
 	filterEngine *filter.Engine,
 	writer *storage.Writer,
 	jobs *job.Store,
@@ -56,11 +68,15 @@ func NewRunner(
 	return &Runner{
 		cfg:       cfg,
 		sessions:  sessions,
+		egress:    egress,
+		limiter:   limiter,
+		cooldown:  gate,
 		filter:    filterEngine,
 		writer:    writer,
 		jobs:      jobs,
-		captcha:   captcha.NewRecovery(cfg.Captcha),
+		captcha:   captcha.NewRecovery(cfg.Captcha, cfg.Kameleo.Endpoint),
 		navigator: pagination.NewNavigator(cfg.Browser.GoogleBaseURL, cfg.Browser.ResultsPerPage, cfg.Browser.MaxPages),
+		searchNav: browser.NewSearchNavigator(cfg.Browser, limiter),
 		log:       log,
 	}
 }
@@ -72,12 +88,26 @@ func (r *Runner) Run(ctx context.Context, req DorkRequest) (*Result, error) {
 	if req.ID == "" {
 		return nil, fmt.Errorf("request id is required")
 	}
+	if err := r.cooldown.Check(); err != nil {
+		return nil, err
+	}
+	if err := r.limiter.AllowSearch(); err != nil {
+		return nil, err
+	}
 
 	dorkJob, err := job.ResumeOrCreate(r.jobs, req.Query, req.ResumeID)
 	if err != nil {
 		return nil, err
 	}
 	jlog := logging.NewJobLogger(r.log, dorkJob.ID, req.ID)
+
+	egressIP, err := r.egress.Verify(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if egressIP != "" {
+		jlog.Info("egress verified", "ip", egressIP, "mode", r.egress.Mode())
+	}
 
 	dorkJob.Status = job.StatusRunning
 	if err := r.jobs.Save(dorkJob); err != nil {
@@ -101,6 +131,13 @@ func (r *Runner) Run(ctx context.Context, req DorkRequest) (*Result, error) {
 			_ = r.sessions.Release(ctx, req.ID, false)
 		}()
 
+		if !lease.Session.IsWarmed() {
+			if err := r.searchNav.WarmSession(ctx, lease.Session); err != nil {
+				return err
+			}
+			lease.Session.MarkWarmed()
+		}
+
 		extractor := extract.NewHybridExtractor()
 		if err := extractor.Install(lease.Session); err != nil {
 			return err
@@ -111,26 +148,34 @@ func (r *Runner) Run(ctx context.Context, req DorkRequest) (*Result, error) {
 				return err
 			}
 
-			searchURL := r.navigator.URL(req.Query, page)
-			if err := lease.Session.Navigate(ctx, searchURL); err != nil {
+			if err := r.searchNav.GoToResults(ctx, lease.Session, req.Query, page); err != nil {
 				return fmt.Errorf("navigate page %d: %w", page, err)
 			}
-			lease.Session.WaitSettle(r.cfg.PageSettle())
+			r.searchNav.ScrollResults(lease.Session)
 			r.sessions.RecordSearch(lease)
 
 			detection, err := r.captcha.Handle(ctx, lease.Session)
+			if lease.Session.Browser == nil {
+				reconnected, recErr := r.sessions.Reconnect(ctx, req.ID, lease.ProfileID)
+				if recErr != nil {
+					return fmt.Errorf("reconnect after sidecar: %w", recErr)
+				}
+				lease = reconnected
+				if err := extractor.Install(lease.Session); err != nil {
+					return err
+				}
+			}
 			if err != nil {
 				r.sessions.RecordCaptcha(lease)
 				dorkJob.LastError = err.Error()
 				_ = r.jobs.Save(dorkJob)
-				if rotateErr := r.rotateSession(ctx, req.ID); rotateErr != nil {
-					return rotateErr
-				}
-				return err
+				r.cooldown.Block(r.cfg.CooldownOnBlock(), "captcha recovery failed")
+				return retry.Permanent(fmt.Errorf("captcha blocked: %w", err))
 			}
 			if detection.Detected {
 				r.sessions.RecordCaptcha(lease)
-				return fmt.Errorf("captcha still present: %s", detection.Type)
+				r.cooldown.Block(r.cfg.CooldownOnBlock(), "captcha still present")
+				return retry.Permanent(fmt.Errorf("captcha still present: %s", detection.Type))
 			}
 
 			rawURLs, err := extractor.Extract(lease.Session)
@@ -165,6 +210,7 @@ func (r *Runner) Run(ctx context.Context, req DorkRequest) (*Result, error) {
 			if !r.navigator.HasNext(lease.Session, page, len(rawURLs)) {
 				break
 			}
+			r.limiter.BeforeAction()
 		}
 		return nil
 	})
@@ -187,12 +233,8 @@ func (r *Runner) Run(ctx context.Context, req DorkRequest) (*Result, error) {
 		URLs:         collected,
 		TotalFound:   deduper.Count(),
 		PagesScraped: dorkJob.CurrentPage,
+		EgressIP:     egressIP,
 	}, nil
-}
-
-func (r *Runner) rotateSession(ctx context.Context, requestID string) error {
-	_, err := r.sessions.Rotate(ctx, requestID)
-	return err
 }
 
 func LoadDorks(path string) ([]string, error) {

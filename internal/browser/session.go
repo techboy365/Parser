@@ -12,11 +12,13 @@ import (
 )
 
 type Session struct {
-	ProfileID string
-	Browser   playwright.Browser
-	Context   playwright.BrowserContext
-	Page      playwright.Page
-	PW        *playwright.Playwright
+	ProfileID   string
+	CDPEndpoint string
+	Browser     playwright.Browser
+	Context     playwright.BrowserContext
+	Page        playwright.Page
+	PW          *playwright.Playwright
+	warmed      bool
 }
 
 type Manager struct {
@@ -61,10 +63,16 @@ func (m *Manager) Connect(ctx context.Context, profileID string) (*Session, erro
 		return nil, fmt.Errorf("no browser contexts available from kameleo profile")
 	}
 	bctx := contexts[0]
-	page, err := bctx.NewPage()
-	if err != nil {
-		browser.Close()
-		return nil, fmt.Errorf("new page: %w", err)
+	pages := bctx.Pages()
+	var page playwright.Page
+	if len(pages) > 0 {
+		page = pages[0]
+	} else {
+		page, err = bctx.NewPage()
+		if err != nil {
+			browser.Close()
+			return nil, fmt.Errorf("new page: %w", err)
+		}
 	}
 
 	timeoutMS := float64(m.cfg.NavigationTimeout().Milliseconds())
@@ -72,22 +80,41 @@ func (m *Manager) Connect(ctx context.Context, profileID string) (*Session, erro
 	page.SetDefaultTimeout(timeoutMS)
 
 	return &Session{
-		ProfileID: profileID,
-		Browser:   browser,
-		Context:   bctx,
-		Page:      page,
-		PW:        m.pw,
+		ProfileID:   profileID,
+		CDPEndpoint: endpoint,
+		Browser:     browser,
+		Context:     bctx,
+		Page:        page,
+		PW:          m.pw,
 	}, nil
+}
+
+func (s *Session) MarkWarmed() {
+	s.warmed = true
+}
+
+func (s *Session) IsWarmed() bool {
+	return s.warmed
 }
 
 func (s *Session) Close() error {
 	if s.Page != nil {
 		_ = s.Page.Close()
+		s.Page = nil
 	}
 	if s.Browser != nil {
-		return s.Browser.Close()
+		err := s.Browser.Close()
+		s.Browser = nil
+		s.Context = nil
+		return err
 	}
 	return nil
+}
+
+// Suspend closes the playwright connection without stopping the Kameleo profile,
+// allowing the CAPTCHA sidecar to attach to the same profile CDP endpoint.
+func (s *Session) Suspend() error {
+	return s.Close()
 }
 
 func (s *Session) Navigate(ctx context.Context, url string) error {
@@ -138,6 +165,10 @@ func BuildSearchURL(base, query string, start int) string {
 		return fmt.Sprintf("%s/search?q=%s&num=10&hl=en", base, urlEncode(q))
 	}
 	return fmt.Sprintf("%s/search?q=%s&start=%d&num=10&hl=en", base, urlEncode(q), start)
+}
+
+func (m *Manager) Reconnect(ctx context.Context, profileID string) (*Session, error) {
+	return m.Connect(ctx, profileID)
 }
 
 func urlEncode(s string) string {

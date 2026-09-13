@@ -4,3 +4,5 @@
 *.log
 /parser
 .DS_Store
+captcha-solver/node_modules/
+captcha-solver/.env
